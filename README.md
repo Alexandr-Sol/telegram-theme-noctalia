@@ -1,65 +1,68 @@
 # Telegram Theme Noctalia
 
+[🇷🇺 Русский](README_RU.md) | [🇺🇸 English](README.md)
+
 <p align="center">
   <img src="blue.png" width="30%">
   <img src="green.png" width="30%">
   <img src="orange.png" width="30%">
 </p>
 
-Скрипт для автоматической генерации и обновления темы Telegram Desktop на основе цветов из Noctalia.
+A script for automatically generating and updating a Telegram Desktop theme based on Noctalia colors.
 
-## Зависимости
+## Dependencies
 
 - **Python 3**
-- **Pillow** (библиотека для работы с изображениями, нужна для генерации паттерна фона)
+- **Pillow** (image processing library, required for generating the background pattern)
 
-Рекомендуется устанавливать Pillow через системный пакетный менеджер:
+It is recommended to install Pillow via your system package manager:
 
 ```bash
-# Для Arch Linux / CachyOS / Manjaro:
+# For Arch Linux / CachyOS / Manjaro:
 sudo pacman -S python python-pillow
 
-# Для Ubuntu / Debian:
+# For Ubuntu / Debian:
 sudo apt install python3 python3-pil
 ```
 
-## Установка
+## Installation
 
-Запустите первоначальную настройку (сделайте скрипт исполняемым `chmod +x`, если необходимо):
+Run the initial setup (make the script executable with `chmod +x` if necessary):
 ```bash
-/ПУТЬ_К_СКРИПТУ/telegram-theme-noctalia install
+/PATH_TO_SCRIPT/telegram-theme-noctalia install
 ```
 
-## Настройка хука в Noctalia
+## Noctalia Hook Setup
 
-Чтобы тема в Telegram обновлялась автоматически при смене цветов в Noctalia, нужно добавить хук:
+To automatically update the Telegram theme when Noctalia colors change, you need to add a hook:
 
-1. Откройте настройки Noctalia.
-2. Перейдите в раздел **Хуки** (Hooks) -> **Генерация цвета** (Color Generation).
-3. Добавьте следующую команду:
+1. Open Noctalia settings.
+2. Go to **Hooks** -> **Color Generation**.
+3. Add the following command:
    ```bash
-   /ПУТЬ_К_СКРИПТУ/telegram-theme-noctalia pack
+   /PATH_TO_SCRIPT/telegram-theme-noctalia pack
    ```
+   *(Replace `/PATH_TO_SCRIPT/` with the actual path to the script).*
 
-## Применение темы в Telegram
+## Applying the Theme in Telegram
 
-При запуске команды `pack` скрипт генерирует архив с темой и сохраняет его по пути:
+When the `pack` command runs, the script generates a theme archive and saves it at:
 ```
 ~/.cache/telegram-theme-noctalia/noctalia.tdesktop-theme
 ```
 
-Чтобы применить тему:
-1. Откройте файловый менеджер и найдите файл `noctalia.tdesktop-theme` в скрытой папке `~/.cache/telegram-theme-noctalia/`.
-2. Перетащите этот файл в Telegram (например, в чат "Избранное").
-3. Нажмите на отправленный файл в чате Telegram.
-4. Появится окно предпросмотра темы — нажмите **"Применить"**.
+To apply the theme:
+1. Open your file manager and find the `noctalia.tdesktop-theme` file in the hidden `~/.cache/telegram-theme-noctalia/` folder.
+2. Drag and drop this file into Telegram (e.g., into "Saved Messages").
+3. Click on the sent file directly in the Telegram chat.
+4. A theme preview window will appear — click **"Apply"**.
 
-Теперь при смене цветов в Noctalia файл темы будет автоматически обновляться, и Telegram сразу подхватит новые цвета.
+Now, whenever the colors change in Noctalia, the theme file will automatically update, and Telegram will instantly apply the new colors!
 
-## Использование
+## Usage
 
-Доступные команды скрипта:
-- `telegram-theme-noctalia install` — создать базовый конфиг и запустить первую генерацию.
-- `telegram-theme-noctalia pack` — сгенерировать ZIP-архив темы `noctalia.tdesktop-theme` (обычно вызывается хуком).
-- `telegram-theme-noctalia paths` — показать текущие пути к файлам конфигурации, цветам и результату.
-- `telegram-theme-noctalia uninstall` — удалить конфиг и директорию с кэшем.
+Available script commands:
+- `/PATH_TO_SCRIPT/telegram-theme-noctalia install` — create the basic config and run the initial generation.
+- `/PATH_TO_SCRIPT/telegram-theme-noctalia pack` — generate the `noctalia.tdesktop-theme` ZIP archive (usually triggered by a hook).
+- `/PATH_TO_SCRIPT/telegram-theme-noctalia paths` — show current paths to the config, colors, and output file.
+- `/PATH_TO_SCRIPT/telegram-theme-noctalia uninstall` — remove the config and cache directory.
