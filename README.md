@@ -17,10 +17,10 @@
 
 ```bash
 # Для Arch Linux / CachyOS / Manjaro:
-sudo pacman -S python-pillow
+sudo pacman -S python python-pillow
 
 # Для Ubuntu / Debian:
-sudo apt install python3-pil
+sudo apt install python3 python3-pil
 ```
 
 ## Установка
