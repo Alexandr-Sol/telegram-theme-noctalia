@@ -1,5 +1,11 @@
 # Telegram Theme Noctalia
 
+<p align="center">
+  <img src="blue.png" width="30%">
+  <img src="green.png" width="30%">
+  <img src="orange.png" width="30%">
+</p>
+
 Скрипт для автоматической генерации и обновления темы Telegram Desktop на основе цветов из Noctalia.
 
 ## Зависимости
@@ -57,16 +63,3 @@ sudo apt install python3-pil
 - `telegram-theme-noctalia pack` — сгенерировать ZIP-архив темы `noctalia.tdesktop-theme` (обычно вызывается хуком).
 - `telegram-theme-noctalia paths` — показать текущие пути к файлам конфигурации, цветам и результату.
 - `telegram-theme-noctalia uninstall` — удалить конфиг и директорию с кэшем.
-
-## Примеры
-
-В зависимости от текущей палитры Noctalia тема автоматически адаптируется. Вот несколько вариантов того, как это может выглядеть:
-
-**Синяя тема:**
-![Синяя тема](blue.png)
-
-**Зеленая тема:**
-![Зеленая тема](green.png)
-
-**Оранжевая тема:**
-![Оранжевая тема](orange.png)
