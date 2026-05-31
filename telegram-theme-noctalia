@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+"""Управление автоматической темой Telegram на основе Noctalia.
+
+Использование:
+  telegram-theme-noctalia install    — установить конфиг и показать команду для хука Noctalia
+  telegram-theme-noctalia uninstall  — удалить все файлы
+  telegram-theme-noctalia pack       — упаковать тему в ZIP (выполняется хуком)
+  telegram-theme-noctalia paths      — показать все пути и их статус
+"""
+
+import configparser
+import io
+import json
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+
+HOME      = Path.home()
+CONFIG    = HOME / ".config/telegram-theme-noctalia/config"
+
+TILE  = 60
+DOT_R = 3
+ALPHA = 40
+
+NOCTALIA_COLORS = HOME / ".config/noctalia/colors.json"
+
+
+def info(msg): print(f"→ {msg}")
+def ok(msg):   print(f"✓ {msg}")
+def warn(msg): print(f"! {msg}")
+def die(msg):  sys.exit(f"✗ {msg}")
+
+
+def write_file(path: Path, content: str, label: str):
+    if path.exists():
+        warn(f"{label} уже существует, перезаписываю: {path}")
+    else:
+        info(f"Создаю {label}: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+# ── Конфиг ────────────────────────────────────────────────────────────────
+
+DEFAULT_CONFIG = """\
+[paths]
+# JSON с цветами, сгенерированный Noctalia
+colors = ~/.config/noctalia/colors.json
+# Итоговый ZIP с темой для Telegram
+output = ~/.cache/telegram-theme-noctalia/noctalia.tdesktop-theme
+
+[pack]
+# Генерировать тайловый PNG-паттерн в качестве фона чатов.
+# Требует Python-пакет Pillow (pip install pillow).
+background = true
+"""
+
+
+def load_config() -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    if CONFIG.exists():
+        cfg.read(CONFIG)
+    return cfg
+
+
+def get_paths(cfg: configparser.ConfigParser) -> SimpleNamespace:
+    def p(key: str, default: Path) -> Path:
+        return Path(cfg.get("paths", key, fallback=str(default))).expanduser()
+
+    colors = p("colors", NOCTALIA_COLORS)
+    output = p("output", HOME / ".cache/telegram-theme-noctalia/noctalia.tdesktop-theme")
+    return SimpleNamespace(
+        colors=colors,
+        output=output,
+        cache=output.parent,
+    )
+
+
+# ── Обработка цветов ──────────────────────────────────────────────────────
+
+def _hex_to_rgb(h: str) -> tuple:
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _blend(hex1: str, hex2: str, ratio: float) -> str:
+    """Смешать два цвета. ratio=0 → hex1, ratio=1 → hex2"""
+    r1, g1, b1 = _hex_to_rgb(hex1)
+    r2, g2, b2 = _hex_to_rgb(hex2)
+    r = int(r1 + (r2 - r1) * ratio)
+    g = int(g1 + (g2 - g1) * ratio)
+    b = int(b1 + (b2 - b1) * ratio)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def load_colors(colors_path: Path) -> dict:
+    """Загрузить colors.json Noctalia и вывести полный словарь цветов для Telegram.
+
+    Noctalia экспортирует только 14 базовых цветов (mPrimary, mSurface, …).
+    Недостающие Material You цвета (контейнеры, поверхности) вычисляются
+    через линейную интерполяцию между surface и соответствующим акцентом.
+    """
+    raw = json.loads(colors_path.read_text())
+
+    p   = raw["mPrimary"]
+    op  = raw["mOnPrimary"]
+    s   = raw["mSecondary"]
+    os_ = raw["mOnSecondary"]
+    t   = raw["mTertiary"]
+    ot  = raw["mOnTertiary"]
+    e   = raw["mError"]
+    oe  = raw["mOnError"]
+    su  = raw["mSurface"]
+    osu = raw["mOnSurface"]
+    sv  = raw["mSurfaceVariant"]
+    osv = raw["mOnSurfaceVariant"]
+    ol  = raw["mOutline"]
+    hv  = raw.get("mHover", t)
+
+    return {
+        "primary":                 p,
+        "onPrimary":               op,
+        "primaryContainer":        _blend(su, p, 0.28),
+        "onPrimaryContainer":      p,
+
+        "secondary":               s,
+        "onSecondary":             os_,
+        "secondaryContainer":      _blend(su, s, 0.28),
+        "onSecondaryContainer":    s,
+
+        "tertiary":                t,
+        "onTertiary":              ot,
+        "tertiaryContainer":       _blend(su, t, 0.28),
+        "onTertiaryContainer":     t,
+
+        "error":                   e,
+        "onError":                 oe,
+        "errorContainer":          _blend(su, e, 0.28),
+        "onErrorContainer":        e,
+
+        "surface":                 su,
+        "onSurface":               osu,
+        "surfaceVariant":          sv,
+        "onSurfaceVariant":        osv,
+
+        "surfaceContainerLowest":  su,
+        "surfaceContainerLow":     _blend(su, sv, 0.33),
+        "surfaceContainer":        _blend(su, sv, 0.50),
+        "surfaceContainerHigh":    _blend(su, sv, 0.67),
+        "surfaceContainerHighest": sv,
+
+        "outline":                 ol,
+        "outlineVariant":          ol,
+
+        # Для иконок контактов используем доступные акцентные цвета
+        "term1": p,
+        "term2": s,
+        "term3": t,
+        "term4": e,
+        "term5": hv,
+    }
+
+
+def _expand_template(template: str, colors: dict) -> str:
+    """Раскрыть {{ name.hexalpha }} и {{ name.hex }} в hex-значения."""
+    def replace(m: re.Match) -> str:
+        name   = m.group(1)
+        suffix = m.group(2)
+        hex6 = colors.get(name, "#000000").lstrip("#")
+        if suffix == "hexalpha":
+            return f"#{hex6}ff"
+        return f"#{hex6}"
+    return re.sub(r"\{\{\s*(\w+)\.(hexalpha|hex)\s*\}\}", replace, template)
+
+
+# ── Шаблон .tdesktop-theme ────────────────────────────────────────────────
+
+TEMPLATE_CONTENT = """\
+// Generated by telegram-theme-noctalia — Material You theme for Telegram Desktop
+
+// --- Shadows / separators ---
+shadowFg: #00000000;
+windowShadowFg: #00000000;
+windowShadowFgFallback: {{ surface.hexalpha }};
+
+// --- Backgrounds ---
+windowBg: {{ surface.hexalpha }};
+windowBgOver: {{ surfaceContainerHigh.hexalpha }};
+windowBgRipple: {{ surfaceContainerHighest.hexalpha }};
+windowBgActive: {{ primary.hexalpha }};
+dialogsBg: {{ surface.hexalpha }};
+dialogsBgOver: {{ surfaceContainerHigh.hexalpha }};
+dialogsBgActive: {{ primary.hexalpha }};
+topBarBg: {{ surface.hexalpha }};
+titleBg: {{ surface.hexalpha }};
+emojiPanBg: {{ surfaceContainerLow.hexalpha }};
+mainMenuBg: {{ surface.hexalpha }};
+menuBg: {{ surface.hexalpha }};
+mainMenuCoverBg: {{ primaryContainer.hexalpha }};
+mainMenuCoverFg: {{ onPrimaryContainer.hexalpha }};
+menuSeparatorFg: {{ outlineVariant.hexalpha }};
+boxBg: {{ surface.hexalpha }};
+boxTitleFg: {{ primary.hexalpha }};
+boxTextFg: {{ onSurface.hexalpha }};
+boxTextFgGood: {{ primary.hexalpha }};
+boxTextFgError: {{ error.hexalpha }};
+checkboxFg: {{ onSurfaceVariant.hexalpha }};
+historyComposeAreaBg: {{ surface.hexalpha }};
+searchedBarBg: {{ surfaceContainer.hexalpha }};
+contactsBgOver: {{ surfaceContainerHigh.hexalpha }};
+filterInputInactiveBg: {{ surfaceContainerHigh.hexalpha }};
+
+// --- Text / icons ---
+windowFg: {{ onSurface.hexalpha }};
+windowFgOver: {{ onSurface.hexalpha }};
+windowBoldFg: {{ onSurface.hexalpha }};
+windowBoldFgOver: {{ primary.hexalpha }};
+windowSubTextFg: {{ onSurfaceVariant.hexalpha }};
+windowSubTextFgOver: {{ onSurfaceVariant.hexalpha }};
+windowActiveTextFg: {{ primary.hexalpha }};
+windowFgActive: {{ onPrimary.hexalpha }};
+menuIconFg: {{ onSurfaceVariant.hexalpha }};
+menuIconFgOver: {{ primary.hexalpha }};
+menuBgOver: {{ surfaceContainerHigh.hexalpha }};
+historyComposeIconFg: {{ onSurfaceVariant.hexalpha }};
+historyComposeIconFgOver: {{ primary.hexalpha }};
+placeholderFg: {{ onSurfaceVariant.hexalpha }};
+
+// --- Dialogs list ---
+dialogsNameFg: {{ onSurface.hexalpha }};
+dialogsNameFgOver: {{ onSurface.hexalpha }};
+dialogsTextFg: {{ onSurfaceVariant.hexalpha }};
+dialogsTextFgOver: {{ onSurfaceVariant.hexalpha }};
+dialogsTextFgService: {{ primary.hexalpha }};
+dialogsChatIconFg: {{ onSurfaceVariant.hexalpha }};
+dialogsDateFg: {{ onSurfaceVariant.hexalpha }};
+dialogsDraftFg: {{ error.hexalpha }};
+dialogsSendingIconFg: {{ onSurfaceVariant.hexalpha }};
+dialogsSentIconFg: {{ primary.hexalpha }};
+dialogsSentIconFgOver: {{ primary.hexalpha }};
+dialogsVerifiedIconBg: {{ primary.hexalpha }};
+dialogsVerifiedIconFg: {{ onPrimary.hexalpha }};
+dialogsUnreadBg: {{ primary.hexalpha }};
+dialogsUnreadBgMuted: {{ onSurfaceVariant.hexalpha }};
+dialogsUnreadBgMutedOver: {{ onSurfaceVariant.hexalpha }};
+dialogsUnreadBgMutedActive: {{ onPrimary.hexalpha }};
+dialogsUnreadFg: {{ onPrimary.hexalpha }};
+dialogsUnreadFgMuted: {{ surface.hexalpha }};
+dialogsMenuIconFg: {{ onSurfaceVariant.hexalpha }};
+dialogsMenuIconFgOver: {{ primary.hexalpha }};
+
+// --- Active (selected) chat row ---
+dialogsNameFgActive: {{ onPrimary.hexalpha }};
+dialogsTextFgActive: {{ onPrimary.hex }}b3;
+dialogsTextFgServiceActive: {{ onPrimary.hexalpha }};
+dialogsDateFgActive: {{ onPrimary.hex }}b3;
+dialogsChatIconFgActive: {{ onPrimary.hexalpha }};
+dialogsDraftFgActive: {{ onPrimary.hexalpha }};
+dialogsSendingIconFgActive: {{ onPrimary.hexalpha }};
+dialogsSentIconFgActive: {{ onPrimary.hexalpha }};
+dialogsUnreadBgActive: {{ onPrimary.hexalpha }};
+dialogsUnreadFgActive: {{ primary.hexalpha }};
+dialogsVerifiedIconBgActive: {{ onPrimary.hexalpha }};
+dialogsVerifiedIconFgActive: {{ primary.hexalpha }};
+dialogsMutedIconFg: {{ onSurfaceVariant.hexalpha }};
+dialogsMutedIconFgOver: {{ onSurfaceVariant.hexalpha }};
+dialogsMutedIconFgActive: {{ onPrimary.hex }}b3;
+dialogsOnlineBadgeFg: {{ tertiary.hexalpha }};
+dialogsOnlineBadgeFgActive: {{ onPrimary.hexalpha }};
+
+// --- Folder sidebar (left column) ---
+sideBarBg: {{ surface.hexalpha }};
+sideBarBgActive: {{ secondaryContainer.hexalpha }};
+sideBarBgRipple: {{ surfaceContainerHighest.hexalpha }};
+sideBarTextFg: {{ onSurfaceVariant.hexalpha }};
+sideBarTextFgActive: {{ onSecondaryContainer.hexalpha }};
+sideBarIconFg: {{ onSurfaceVariant.hexalpha }};
+sideBarIconFgActive: {{ onSecondaryContainer.hexalpha }};
+sideBarBadgeBg: {{ primary.hexalpha }};
+sideBarBadgeBgMuted: {{ onSurfaceVariant.hexalpha }};
+sideBarBadgeFg: {{ onPrimary.hexalpha }};
+
+// --- Active/primary buttons ---
+activeButtonBg: {{ primary.hexalpha }};
+activeButtonBgOver: {{ primary.hexalpha }};
+activeButtonBgRipple: {{ primaryContainer.hexalpha }};
+activeButtonFg: {{ onPrimary.hexalpha }};
+activeButtonFgOver: {{ onPrimary.hexalpha }};
+activeButtonSecondaryFg: {{ onPrimary.hexalpha }};
+activeButtonSecondaryFgOver: {{ onPrimary.hexalpha }};
+lightButtonBg: {{ surface.hex }}00;
+lightButtonBgOver: {{ primary.hex }}26;
+lightButtonBgRipple: {{ primary.hex }}40;
+lightButtonFg: {{ primary.hexalpha }};
+lightButtonFgOver: {{ primary.hexalpha }};
+windowBgRipple: {{ surfaceContainerHighest.hexalpha }};
+activeLineFg: {{ primary.hexalpha }};
+filterInputBorderFg: {{ primary.hexalpha }};
+
+// --- Tray / verified ---
+trayCounterBg: {{ primary.hexalpha }};
+trayCounterBgMute: {{ onSurfaceVariant.hex }}64;
+trayCounterFg: {{ onPrimary.hexalpha }};
+profileVerifiedCheckBg: {{ primary.hexalpha }};
+profileVerifiedCheckFg: {{ onPrimary.hexalpha }};
+profileAdminStartFg: {{ tertiary.hexalpha }};
+
+// --- Messages ---
+msgInBg: {{ surfaceContainerHigh.hexalpha }};
+msgInBgSelected: {{ tertiaryContainer.hexalpha }};
+msgOutBg: {{ primaryContainer.hexalpha }};
+msgOutBgSelected: {{ tertiaryContainer.hexalpha }};
+msgInShadow: #00000000;
+msgInShadowSelected: #00000000;
+msgOutShadow: #00000000;
+msgOutShadowSelected: #00000000;
+msgInDateFg: {{ onSurfaceVariant.hexalpha }};
+msgInDateFgSelected: {{ onTertiaryContainer.hexalpha }};
+msgOutDateFg: {{ onPrimaryContainer.hexalpha }};
+msgOutDateFgSelected: {{ onTertiaryContainer.hexalpha }};
+msgInServiceFg: {{ onSurfaceVariant.hexalpha }};
+msgInServiceFgSelected: {{ onTertiaryContainer.hexalpha }};
+msgOutServiceFg: {{ onPrimaryContainer.hexalpha }};
+msgOutServiceFgSelected: {{ onTertiaryContainer.hexalpha }};
+msgServiceFg: {{ onSurface.hexalpha }};
+msgServiceBg: {{ surfaceContainerHighest.hex }}cc;
+msgServiceBgSelected: {{ surfaceContainerHighest.hex }}e6;
+msgInReplyBarColor: {{ primary.hexalpha }};
+msgInReplyBarSelColor: {{ primary.hexalpha }};
+msgOutReplyBarColor: {{ onPrimaryContainer.hexalpha }};
+msgOutReplyBarSelColor: {{ onPrimaryContainer.hexalpha }};
+msgInMonoFg: {{ onSurface.hexalpha }};
+msgOutMonoFg: {{ onPrimaryContainer.hexalpha }};
+
+// --- History text ---
+historyTextInFg: {{ onSurface.hexalpha }};
+historyTextInFgSelected: {{ onTertiaryContainer.hexalpha }};
+historyTextOutFg: {{ onPrimaryContainer.hexalpha }};
+historyTextOutFgSelected: {{ onTertiaryContainer.hexalpha }};
+historyLinkInFg: {{ primary.hexalpha }};
+historyLinkInFgSelected: {{ onTertiaryContainer.hexalpha }};
+historyLinkOutFg: {{ onPrimaryContainer.hexalpha }};
+historyLinkOutFgSelected: {{ onTertiaryContainer.hexalpha }};
+historyFileNameInFg: {{ onSurface.hexalpha }};
+historyFileNameOutFg: {{ onPrimaryContainer.hexalpha }};
+historyFileNameInFgSelected: {{ onTertiaryContainer.hexalpha }};
+historyFileNameOutFgSelected: {{ onTertiaryContainer.hexalpha }};
+historyOutIconFg: {{ onPrimaryContainer.hexalpha }};
+historyOutIconFgSelected: {{ onTertiaryContainer.hexalpha }};
+historyIconFgInverted: {{ primary.hexalpha }};
+historySendingInIconFg: {{ onSurfaceVariant.hexalpha }};
+historySendingOutIconFg: {{ onPrimaryContainer.hexalpha }};
+
+// --- File thumb links ---
+msgFileThumbLinkInFg: {{ primary.hexalpha }};
+msgFileThumbLinkInFgSelected: {{ onTertiaryContainer.hexalpha }};
+msgFileThumbLinkOutFg: {{ onPrimaryContainer.hexalpha }};
+msgFileThumbLinkOutFgSelected: {{ onTertiaryContainer.hexalpha }};
+
+// --- File icons ---
+msgFileInBg: {{ primary.hexalpha }};
+msgFileInBgOver: {{ primary.hexalpha }};
+msgFileInBgSelected: {{ primaryContainer.hexalpha }};
+msgFileOutBg: {{ primary.hexalpha }};
+msgFileOutBgOver: {{ primary.hexalpha }};
+msgFileOutBgSelected: {{ primaryContainer.hexalpha }};
+historyFileInIconFg: {{ onPrimary.hexalpha }};
+historyFileInIconFgSelected: {{ onPrimaryContainer.hexalpha }};
+historyFileOutIconFg: {{ onPrimary.hexalpha }};
+historyFileOutIconFgSelected: {{ onPrimaryContainer.hexalpha }};
+historyFileInRadialFg: {{ onPrimary.hexalpha }};
+historyFileInRadialFgSelected: {{ onPrimaryContainer.hexalpha }};
+historyFileOutRadialFg: {{ onPrimary.hexalpha }};
+historyFileOutRadialFgSelected: {{ onPrimaryContainer.hexalpha }};
+
+// --- Radial loader ---
+radialFg: #ffffffff;
+radialBg: #00000066;
+videoPlayIconBg: #00000099;
+videoPlayIconFg: {{ primary.hexalpha }};
+historyFileThumbIconFg: {{ primary.hexalpha }};
+historyFileThumbRadialFg: {{ primary.hexalpha }};
+
+// --- Date overlay on media ---
+msgDateImgFg: {{ primary.hexalpha }};
+msgDateImgBg: #00000099;
+msgDateImgBgOver: #000000b3;
+msgDateImgBgSelected: #000000b3;
+
+// --- File type colors ---
+msgFile1Bg: {{ primary.hexalpha }};
+msgFile1BgDark: {{ primaryContainer.hexalpha }};
+msgFile1BgOver: {{ primaryContainer.hexalpha }};
+msgFile1BgSelected: {{ onPrimaryContainer.hexalpha }};
+msgFile2Bg: {{ tertiary.hexalpha }};
+msgFile2BgDark: {{ tertiaryContainer.hexalpha }};
+msgFile2BgOver: {{ tertiaryContainer.hexalpha }};
+msgFile2BgSelected: {{ onTertiaryContainer.hexalpha }};
+msgFile3Bg: {{ secondary.hexalpha }};
+msgFile3BgDark: {{ secondaryContainer.hexalpha }};
+msgFile3BgOver: {{ secondaryContainer.hexalpha }};
+msgFile3BgSelected: {{ onSecondaryContainer.hexalpha }};
+msgFile4Bg: {{ error.hexalpha }};
+msgFile4BgDark: {{ errorContainer.hexalpha }};
+msgFile4BgOver: {{ errorContainer.hexalpha }};
+msgFile4BgSelected: {{ onErrorContainer.hexalpha }};
+
+// --- Scroll to bottom button ---
+historyToDownBg: {{ surfaceContainerHigh.hexalpha }};
+historyToDownBgOver: {{ surfaceContainer.hexalpha }};
+historyToDownFg: {{ primary.hexalpha }};
+historyToDownFgOver: {{ primary.hexalpha }};
+historyToDownShadow: {{ outline.hexalpha }};
+historyComposeButtonBgOver: {{ surfaceContainerHigh.hexalpha }};
+
+// --- Scrollbars ---
+historyScrollBarBg: {{ primary.hex }}53;
+historyScrollBg: {{ surfaceVariant.hexalpha }};
+historyScrollBarBgOver: {{ primary.hexalpha }};
+historyScrollBgOver: {{ surfaceVariant.hexalpha }};
+scrollBarBg: {{ primary.hexalpha }};
+scrollBg: {{ surface.hex }}00;
+scrollBarBgOver: {{ primary.hexalpha }};
+scrollBgOver: {{ surface.hex }}00;
+
+// --- Unread bar ---
+historyUnreadBarFg: {{ onSurface.hexalpha }};
+historyUnreadBarBg: {{ surfaceContainerHigh.hexalpha }};
+
+// --- Waveform ---
+msgWaveformInActive: {{ primary.hexalpha }};
+msgWaveformInInactive: {{ onSurfaceVariant.hex }}66;
+msgWaveformInInactiveSelected: {{ onSurfaceVariant.hex }}66;
+msgWaveformOutActive: {{ primary.hexalpha }};
+msgWaveformOutInactive: {{ onPrimaryContainer.hex }}66;
+msgWaveformOutInactiveSelected: {{ onPrimaryContainer.hex }}66;
+
+// --- Selection checkmarks ---
+overviewCheckBg: {{ surfaceContainerHighest.hex }}80;
+overviewCheckFg: {{ primary.hexalpha }};
+overviewCheckFgActive: {{ onPrimary.hexalpha }};
+overviewPhotoSelectOverlay: {{ primary.hex }}40;
+msgSelectOverlay: {{ primaryContainer.hex }}66;
+
+// --- Peer userpic colors ---
+historyPeer1UserpicBg: {{ primary.hexalpha }};
+historyPeer2UserpicBg: {{ tertiary.hexalpha }};
+historyPeer3UserpicBg: {{ term2.hexalpha }};
+historyPeer4UserpicBg: {{ term3.hexalpha }};
+historyPeer5UserpicBg: {{ secondary.hexalpha }};
+historyPeer6UserpicBg: {{ term5.hexalpha }};
+historyPeer7UserpicBg: {{ term1.hexalpha }};
+historyPeer8UserpicBg: {{ tertiaryContainer.hexalpha }};
+historyPeerUserpicFg: {{ surface.hexalpha }};
+historyPeer1NameFg: {{ primary.hexalpha }};
+historyPeer2NameFg: {{ tertiary.hexalpha }};
+historyPeer3NameFg: {{ term2.hexalpha }};
+historyPeer4NameFg: {{ term3.hexalpha }};
+historyPeer5NameFg: {{ secondary.hexalpha }};
+historyPeer6NameFg: {{ term5.hexalpha }};
+historyPeer7NameFg: {{ term1.hexalpha }};
+"""
+
+
+# ── Команды ────────────────────────────────────────────────────────────────
+
+def cmd_pack():
+    cfg = load_config()
+    paths = get_paths(cfg)
+    use_bg = cfg.getboolean("pack", "background", fallback=True)
+
+    if not paths.colors.exists():
+        die(f"Файл цветов Noctalia не найден: {paths.colors}\n  Смените тему в Noctalia хотя бы один раз.")
+
+    colors = load_colors(paths.colors)
+    theme_content = _expand_template(TEMPLATE_CONTENT, colors)
+
+    pattern_png = None
+    if use_bg:
+        try:
+            from PIL import Image, ImageDraw
+        except ImportError:
+            die(
+                "Python-пакет Pillow не установлен (pip install pillow).\n"
+                f"  Или отключите фон в конфиге: {CONFIG}\n"
+                "  background = false"
+            )
+
+        def hex_to_rgb(h: str) -> tuple:
+            h = h.lstrip("#")
+            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+        def make_pattern(surface: tuple, dot_color: tuple) -> bytes:
+            img = Image.new("RGB", (TILE, TILE), surface)
+            overlay = Image.new("RGBA", (TILE, TILE), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+            half = TILE // 2
+            for x, y in [(0, 0), (half, half), (TILE, 0), (0, TILE), (TILE, TILE)]:
+                draw.ellipse([x - DOT_R, y - DOT_R, x + DOT_R, y + DOT_R], fill=(*dot_color, ALPHA))
+            img.paste(overlay, mask=overlay)
+            buf = io.BytesIO()
+            img.save(buf, "PNG")
+            return buf.getvalue()
+
+        pattern_png = make_pattern(
+            hex_to_rgb(colors.get("surface", "#000000")),
+            hex_to_rgb(colors.get("primary", "#ffffff")),
+        )
+
+    paths.cache.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(paths.output, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("colors.tdesktop-theme", theme_content)
+        if pattern_png is not None:
+            zf.writestr("tiled.png", pattern_png)
+    print(f"packed → {paths.output}")
+
+
+def cmd_install():
+    if not CONFIG.exists():
+        write_file(CONFIG, DEFAULT_CONFIG, "конфиг")
+    else:
+        info(f"Конфиг уже существует: {CONFIG}")
+
+    cfg = load_config()
+    paths = get_paths(cfg)
+
+    if cfg.getboolean("pack", "background", fallback=True):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            warn("Pillow не установлен — фон чатов не будет сгенерирован.")
+            warn("  Установите: pip install pillow")
+            warn(f"  Или отключите: {CONFIG}  →  background = false")
+
+    paths.cache.mkdir(parents=True, exist_ok=True)
+
+    if NOCTALIA_COLORS.exists():
+        info("Запускаю первую упаковку темы...")
+        cmd_pack()
+
+    hook_cmd = f"{Path(__file__).resolve()} pack"
+    print("\n" + "="*70)
+    ok("Установка файлов завершена.")
+    print("\nДля автоматического обновления темы добавьте эту команду в Noctalia:")
+    print("Настройки -> Хуки -> Генерация цвета (Settings -> Hooks -> Color Generation)")
+    print(f"\n  {hook_cmd}")
+    print("\n" + "="*70 + "\n")
+
+
+def cmd_uninstall():
+    cfg = load_config()
+    paths = get_paths(cfg)
+
+    if CONFIG.exists():
+        CONFIG.unlink()
+        ok(f"Удалён: {CONFIG}")
+
+    if paths.cache.exists():
+        shutil.rmtree(paths.cache)
+        ok(f"Удалена директория: {paths.cache}")
+
+    ok("Удаление завершено")
+
+
+def cmd_paths():
+    cfg = load_config()
+    paths = get_paths(cfg)
+
+    def status(path: Path) -> str:
+        return "✓" if path.exists() else "✗"
+
+    rows = [
+        ("Конфиг",           CONFIG),
+        ("Цвета Noctalia",   paths.colors),
+        ("ZIP тема",         paths.output),
+    ]
+    width = max(len(label) for label, _ in rows)
+    for label, path in rows:
+        print(f"  {status(path)}  {label:{width}}  {path}")
+
+
+# ── Точка входа ────────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "install":         cmd_install,
+    "uninstall":       cmd_uninstall,
+    "pack":            cmd_pack,
+    "paths":           cmd_paths,
+}
+
+if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
+    print(__doc__)
+    sys.exit(1)
+
+COMMANDS[sys.argv[1]]()
